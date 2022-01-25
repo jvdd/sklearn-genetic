@@ -16,7 +16,7 @@
 """Genetic algorithm for feature selection"""
 
 import numbers
-import multiprocess
+from multiprocess import Pool
 import numpy as np
 from sklearn.utils import check_X_y
 from sklearn.utils.metaestimators import if_delegate_has_method
@@ -38,10 +38,53 @@ creator.create("Fitness", base.Fitness, weights=(1.0, -1.0, -1.0))
 creator.create("Individual", list, fitness=creator.Fitness)
 
 
-def _eaFunction(population, toolbox, cxpb, mutpb, ngen, ngen_no_change=None, stats=None,
-                halloffame=None, verbose=0):
+from dataclasses import dataclass
+
+
+@dataclass
+class IndividualInfo:
+    ## The dataclass properties
+    features: list
+    scores: list  # list of the accompanying test scores
+
+    ## The dataclass methods
+    def get_score_stats(self):
+        """Return the mean and the std of the first score."""
+        first_scores = np.atleast_2d(self.scores)[0]
+        return np.mean(first_scores), np.std(first_scores)
+
+    def nb_features(self):
+        """Return the number of features for the individual."""
+        return np.sum(self.features)
+
+    def get_evaluation_info(self):
+        """Return the mean score, nb features, std score.
+
+        These 3 metrics are used in the fitness function.
+        """
+        score_stats = self.get_score_stats()
+        return score_stats[0], self.nb_features(), score_stats[1]
+
+    def print_stats(self):
+        print("# features:", self.nb_features())
+        for s in np.atleast_2d(self.scores):
+            print("${:.4f} +/- {:.4f}".format(np.mean(s), np.std(s)))
+
+
+def _eaFunction(
+    population,
+    toolbox,
+    cxpb,
+    mutpb,
+    ngen,
+    ngen_no_change=None,
+    stats=None,
+    halloffame=None,
+    verbose=0,
+    scores_cache={},
+):
     logbook = tools.Logbook()
-    logbook.header = ['gen', 'nevals'] + (stats.fields if stats else [])
+    logbook.header = ["gen", "nevals"] + (stats.fields if stats else [])
 
     # Evaluate the individuals with an invalid fitness
     invalid_ind = [ind for ind in population if not ind.fitness.valid]
@@ -99,6 +142,11 @@ def _eaFunction(population, toolbox, cxpb, mutpb, ngen, ngen_no_change=None, sta
             wait += 1
         else:
             wait = 0
+            if verbose:
+                print("New best individual:")
+                print(halloffame[0])
+                if scores_cache:
+                    scores_cache[tuple(halloffame[0])].print_stats()
 
         # If the counter reached the termination criteria, stop the optimization
         if ngen_no_change is not None and wait >= ngen_no_change:
@@ -114,22 +162,47 @@ def _createIndividual(icls, n, max_features):
     return icls(genome)
 
 
-def _evalFunction(individual, estimator, X, y, groups, cv, scorer, fit_params, max_features,
-                  caching, scores_cache={}):
-    individual_sum = np.sum(individual, axis=0)
-    if individual_sum == 0 or individual_sum > max_features:
+def _evalFunction(
+    individual,
+    estimator,
+    X,
+    y,
+    groups,
+    cv,
+    scorer,
+    fit_params,
+    max_features,
+    caching,
+    scores_cache={},
+    cross_val_procedure=None,  # takes 3 params: x, y, groups=None
+):
+    individual_sum = np.sum(individual, axis=0)  # the number of selected features
+    if individual_sum == 0:  # or individual_sum > max_features:
         return -10000, individual_sum, 10000
     individual_tuple = tuple(individual)
+    
+    # Return early if the individual has already been cached
     if caching and individual_tuple in scores_cache:
-        return scores_cache[individual_tuple][0], individual_sum, scores_cache[individual_tuple][1]
+        return scores_cache[individual_tuple].get_evaluation_info()
+    
     X_selected = X[:, np.array(individual, dtype=np.bool)]
-    scores = cross_val_score(estimator=estimator, X=X_selected, y=y, groups=groups, scoring=scorer,
-                             cv=cv, fit_params=fit_params)
-    scores_mean = np.mean(scores)
-    scores_std = np.std(scores)
+    if cross_val_procedure is not None:
+        scores = cross_val_procedure(X_selected, y, groups)
+        individual_info = IndividualInfo(individual, scores)
+    else:
+        scores = cross_val_score(
+            estimator=estimator,
+            X=X_selected,
+            y=y,
+            groups=groups,
+            scoring=scorer,
+            cv=cv,
+            fit_params=fit_params,
+        )
+        individual_info = IndividualInfo(individual, scores)
     if caching:
-        scores_cache[individual_tuple] = [scores_mean, scores_std]
-    return scores_mean, individual_sum, scores_std
+        scores_cache[individual_tuple] = individual_info
+    return individual_info.get_evaluation_info()
 
 
 class GeneticSelectionCV(BaseEstimator, MetaEstimatorMixin, SelectorMixin):
@@ -232,11 +305,28 @@ class GeneticSelectionCV(BaseEstimator, MetaEstimatorMixin, SelectorMixin):
     array([ True  True  True  True False False False False False False False False
            False False False False False False False False False False False False], dtype=bool)
     """
-    def __init__(self, estimator, cv=None, scoring=None, fit_params=None, max_features=None,
-                 verbose=0, n_jobs=1, n_population=300, crossover_proba=0.5, mutation_proba=0.2,
-                 n_generations=40, crossover_independent_proba=0.1,
-                 mutation_independent_proba=0.05, tournament_size=3, n_gen_no_change=None,
-                 caching=False):
+
+    def __init__(
+        self,
+        estimator,
+        cv=None,
+        scoring=None,
+        fit_params=None,
+        max_features=None,
+        verbose=0,
+        n_jobs=1,
+        n_population=300,
+        crossover_proba=0.5,
+        mutation_proba=0.2,
+        n_generations=40,
+        crossover_independent_proba=0.1,
+        mutation_independent_proba=0.05,
+        tournament_size=3,
+        n_gen_no_change=None,
+        caching=False,
+        base_features=None,
+        cross_val_procedure=None,  # Returns multiple metrics
+    ):
         self.estimator = estimator
         self.cv = cv
         self.scoring = scoring
@@ -254,6 +344,8 @@ class GeneticSelectionCV(BaseEstimator, MetaEstimatorMixin, SelectorMixin):
         self.n_gen_no_change = n_gen_no_change
         self.caching = caching
         self.scores_cache = {}
+        self.base_features = base_features
+        self.cross_val_procedure = cross_val_procedure
 
     @property
     def _estimator_type(self):
@@ -286,63 +378,100 @@ class GeneticSelectionCV(BaseEstimator, MetaEstimatorMixin, SelectorMixin):
 
         if self.max_features is not None:
             if not isinstance(self.max_features, numbers.Integral):
-                raise TypeError("'max_features' should be an integer between 1 and {} features."
-                                " Got {!r} instead."
-                                .format(n_features, self.max_features))
+                raise TypeError(
+                    "'max_features' should be an integer between 1 and {} features."
+                    " Got {!r} instead.".format(n_features, self.max_features)
+                )
             elif self.max_features < 1 or self.max_features > n_features:
-                raise ValueError("'max_features' should be between 1 and {} features."
-                                 " Got {} instead."
-                                 .format(n_features, self.max_features))
+                raise ValueError(
+                    "'max_features' should be between 1 and {} features."
+                    " Got {} instead.".format(n_features, self.max_features)
+                )
             max_features = self.max_features
         else:
             max_features = n_features
 
-        if not isinstance(self.n_gen_no_change, (numbers.Integral, np.integer, type(None))):
-            raise ValueError("'n_gen_no_change' should either be None or an integer."
-                             " {} was passed."
-                             .format(self.n_gen_no_change))
+        if not isinstance(
+            self.n_gen_no_change, (numbers.Integral, np.integer, type(None))
+        ):
+            raise ValueError(
+                "'n_gen_no_change' should either be None or an integer."
+                " {} was passed.".format(self.n_gen_no_change)
+            )
 
         estimator = clone(self.estimator)
 
         # Genetic Algorithm
         toolbox = base.Toolbox()
 
-        toolbox.register("individual", _createIndividual, creator.Individual, n=n_features,
-                         max_features=max_features)
+        toolbox.register(
+            "individual",
+            _createIndividual,
+            creator.Individual,
+            n=n_features,
+            max_features=max_features,
+        )
         toolbox.register("population", tools.initRepeat, list, toolbox.individual)
-        toolbox.register("evaluate", _evalFunction, estimator=estimator, X=X, y=y,
-                         groups=groups, cv=cv, scorer=scorer, fit_params=self.fit_params,
-                         max_features=max_features, caching=self.caching,
-                         scores_cache=self.scores_cache)
-        toolbox.register("mate", tools.cxUniform, indpb=self.crossover_independent_proba)
-        toolbox.register("mutate", tools.mutFlipBit, indpb=self.mutation_independent_proba)
+        toolbox.register(
+            "evaluate",
+            _evalFunction,
+            estimator=estimator,
+            X=X,
+            y=y,
+            groups=groups,
+            cv=cv,
+            scorer=scorer,
+            fit_params=self.fit_params,
+            max_features=max_features,
+            caching=self.caching,
+            scores_cache=self.scores_cache,
+            cross_val_procedure=self.cross_val_procedure
+        )
+        toolbox.register(
+            "mate", tools.cxUniform, indpb=self.crossover_independent_proba
+        )
+        toolbox.register(
+            "mutate", tools.mutFlipBit, indpb=self.mutation_independent_proba
+        )
         toolbox.register("select", tools.selTournament, tournsize=self.tournament_size)
 
         if self.n_jobs == 0:
             raise ValueError("n_jobs == 0 has no meaning.")
         elif self.n_jobs > 1:
-            pool = multiprocess.Pool(processes=self.n_jobs)
+            pool = Pool(processes=self.n_jobs)
             toolbox.register("map", pool.map)
         elif self.n_jobs < 0:
-            pool = multiprocess.Pool(processes=max(cpu_count() + 1 + self.n_jobs, 1))
+            pool = Pool(processes=max(cpu_count() + 1 + self.n_jobs, 1))
             toolbox.register("map", pool.map)
 
         pop = toolbox.population(n=self.n_population)
+        if self.base_features:
+            pop += list(map(creator.Individual, (np.atleast_2d(self.base_features))))
+            
+        print([np.sum(i) for i in pop])
         hof = tools.HallOfFame(1, similar=np.array_equal)
         stats = tools.Statistics(lambda ind: ind.fitness.values)
         stats.register("avg", np.mean, axis=0)
-        stats.register("std", np.std, axis=0)
-        stats.register("min", np.min, axis=0)
-        stats.register("max", np.max, axis=0)
+        # stats.register("std", np.std, axis=0)
+        # stats.register("min", np.min, axis=0)
+        # stats.register("max", np.max, axis=0)
 
         if self.verbose > 0:
             print("Selecting features with genetic algorithm.")
 
         with np.printoptions(precision=6, suppress=True, sign=" "):
-            _, log = _eaFunction(pop, toolbox, cxpb=self.crossover_proba,
-                                 mutpb=self.mutation_proba, ngen=self.n_generations,
-                                 ngen_no_change=self.n_gen_no_change,
-                                 stats=stats, halloffame=hof, verbose=self.verbose)
+            _, log = _eaFunction(
+                pop,
+                toolbox,
+                cxpb=self.crossover_proba,
+                mutpb=self.mutation_proba,
+                ngen=self.n_generations,
+                ngen_no_change=self.n_gen_no_change,
+                stats=stats,
+                halloffame=hof,
+                verbose=self.verbose,
+                scores_cache=self.scores_cache,
+            )
         if self.n_jobs != 1:
             pool.close()
             pool.join()
@@ -358,7 +487,7 @@ class GeneticSelectionCV(BaseEstimator, MetaEstimatorMixin, SelectorMixin):
 
         return self
 
-    @if_delegate_has_method(delegate='estimator')
+    @if_delegate_has_method(delegate="estimator")
     def predict(self, X):
         """Reduce X to the selected features and then predict using the underlying estimator.
 
@@ -374,7 +503,7 @@ class GeneticSelectionCV(BaseEstimator, MetaEstimatorMixin, SelectorMixin):
         """
         return self.estimator_.predict(self.transform(X))
 
-    @if_delegate_has_method(delegate='estimator')
+    @if_delegate_has_method(delegate="estimator")
     def score(self, X, y):
         """Reduce X to the selected features and return the score of the underlying estimator.
 
@@ -391,14 +520,14 @@ class GeneticSelectionCV(BaseEstimator, MetaEstimatorMixin, SelectorMixin):
     def _get_support_mask(self):
         return self.support_
 
-    @if_delegate_has_method(delegate='estimator')
+    @if_delegate_has_method(delegate="estimator")
     def decision_function(self, X):
         return self.estimator_.decision_function(self.transform(X))
 
-    @if_delegate_has_method(delegate='estimator')
+    @if_delegate_has_method(delegate="estimator")
     def predict_proba(self, X):
         return self.estimator_.predict_proba(self.transform(X))
 
-    @if_delegate_has_method(delegate='estimator')
+    @if_delegate_has_method(delegate="estimator")
     def predict_log_proba(self, X):
         return self.estimator_.predict_log_proba(self.transform(X))
