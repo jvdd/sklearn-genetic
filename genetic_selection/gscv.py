@@ -34,11 +34,12 @@ from deap import creator
 from deap import tools
 
 
+from tqdm import tqdm
+from dataclasses import dataclass
+
+
 creator.create("Fitness", base.Fitness, weights=(1.0, -1.0, -1.0))
 creator.create("Individual", list, fitness=creator.Fitness)
-
-
-from dataclasses import dataclass
 
 
 @dataclass
@@ -68,10 +69,23 @@ class IndividualInfo:
     def print_stats(self):
         print("# features:", self.nb_features())
         for s in np.atleast_2d(self.scores):
-            print("${:.4f} +/- {:.4f}".format(np.mean(s), np.std(s)))
+            print("    {:.4f} +/- {:.4f}".format(np.mean(s), np.std(s)))
+
+
+# ------------------------------------------------------------------------------------ #
+#                                    utility functions
+# ------------------------------------------------------------------------------------ #
 
 
 def _eaFunction(
+    estimator,
+    X,
+    y,
+    groups,
+    cv,
+    scorer,
+    fit_params,
+    cross_val_procedure,
     population,
     toolbox,
     cxpb,
@@ -88,7 +102,7 @@ def _eaFunction(
 
     # Evaluate the individuals with an invalid fitness
     invalid_ind = [ind for ind in population if not ind.fitness.valid]
-    fitnesses = toolbox.map(toolbox.evaluate, invalid_ind)
+    fitnesses = toolbox.map(toolbox.evaluate, tqdm(invalid_ind))
     for ind, fit in zip(invalid_ind, fitnesses):
         ind.fitness.values = fit
 
@@ -103,6 +117,23 @@ def _eaFunction(
     if verbose:
         print(logbook.stream)
 
+        print("First best individual:")
+        print(np.where(halloffame[0])[0], np.sum(halloffame[0]))
+        if tuple(halloffame[0]) in scores_cache:
+            scores_cache[tuple(halloffame[0])].print_stats()
+        else:
+            _calculate_scores(
+                halloffame[0],
+                estimator,
+                X,
+                y,
+                groups,
+                cv,
+                scorer,
+                fit_params,
+                cross_val_procedure,
+            ).print_stats()
+
     # Begin the generational process
     wait = 0
     for gen in range(1, ngen + 1):
@@ -114,7 +145,7 @@ def _eaFunction(
 
         # Evaluate the individuals with an invalid fitness
         invalid_ind = [ind for ind in offspring if not ind.fitness.valid]
-        fitnesses = toolbox.map(toolbox.evaluate, invalid_ind)
+        fitnesses = tqdm(toolbox.map(toolbox.evaluate, invalid_ind))
         for ind, fit in zip(invalid_ind, fitnesses):
             ind.fitness.values = fit
 
@@ -144,9 +175,21 @@ def _eaFunction(
             wait = 0
             if verbose:
                 print("New best individual:")
-                print(halloffame[0])
-                if scores_cache:
+                print(np.where(halloffame[0])[0], np.sum(halloffame[0]))
+                if tuple(halloffame[0]) in scores_cache:
                     scores_cache[tuple(halloffame[0])].print_stats()
+                else:
+                    _calculate_scores(
+                        halloffame[0],
+                        estimator,
+                        X,
+                        y,
+                        groups,
+                        cv,
+                        scorer,
+                        fit_params,
+                        cross_val_procedure,
+                    ).print_stats()
 
         # If the counter reached the termination criteria, stop the optimization
         if ngen_no_change is not None and wait >= ngen_no_change:
@@ -160,6 +203,27 @@ def _createIndividual(icls, n, max_features):
     genome = ([1] * n_features) + ([0] * (n - n_features))
     np.random.shuffle(genome)
     return icls(genome)
+
+
+def _calculate_scores(
+    individual, estimator, X, y, groups, cv, scorer, fit_params, cross_val_procedure
+):
+    X_selected = X[:, np.array(individual, dtype=np.bool)]
+    if cross_val_procedure is not None:
+        scores = cross_val_procedure(X_selected, y, groups)
+        individual_info = IndividualInfo(individual, scores)
+    else:
+        scores = cross_val_score(
+            estimator=estimator,
+            X=X_selected,
+            y=y,
+            groups=groups,
+            scoring=scorer,
+            cv=cv,
+            fit_params=fit_params,
+        )
+        individual_info = IndividualInfo(individual, scores)
+    return individual_info
 
 
 def _evalFunction(
@@ -180,28 +244,17 @@ def _evalFunction(
     if individual_sum == 0:  # or individual_sum > max_features:
         return -10000, individual_sum, 10000
     individual_tuple = tuple(individual)
-    
+
     # Return early if the individual has already been cached
     if caching and individual_tuple in scores_cache:
         return scores_cache[individual_tuple].get_evaluation_info()
-    
-    X_selected = X[:, np.array(individual, dtype=np.bool)]
-    if cross_val_procedure is not None:
-        scores = cross_val_procedure(X_selected, y, groups)
-        individual_info = IndividualInfo(individual, scores)
-    else:
-        scores = cross_val_score(
-            estimator=estimator,
-            X=X_selected,
-            y=y,
-            groups=groups,
-            scoring=scorer,
-            cv=cv,
-            fit_params=fit_params,
-        )
-        individual_info = IndividualInfo(individual, scores)
+
+    individual_info = _calculate_scores(
+        individual, estimator, X, y, groups, cv, scorer, fit_params, cross_val_procedure
+    )
     if caching:
         scores_cache[individual_tuple] = individual_info
+        # print("Cache len:", len(scores_cache.keys()))
     return individual_info.get_evaluation_info()
 
 
@@ -323,9 +376,9 @@ class GeneticSelectionCV(BaseEstimator, MetaEstimatorMixin, SelectorMixin):
         mutation_independent_proba=0.05,
         tournament_size=3,
         n_gen_no_change=None,
-        caching=False,
+        caching=True,
         base_features=None,
-        cross_val_procedure=None,  # Returns multiple metrics
+        cross_val_procedure=None,  # Returns one or multiple metrics
     ):
         self.estimator = estimator
         self.cv = cv
@@ -425,7 +478,7 @@ class GeneticSelectionCV(BaseEstimator, MetaEstimatorMixin, SelectorMixin):
             max_features=max_features,
             caching=self.caching,
             scores_cache=self.scores_cache,
-            cross_val_procedure=self.cross_val_procedure
+            cross_val_procedure=self.cross_val_procedure,
         )
         toolbox.register(
             "mate", tools.cxUniform, indpb=self.crossover_independent_proba
@@ -447,22 +500,30 @@ class GeneticSelectionCV(BaseEstimator, MetaEstimatorMixin, SelectorMixin):
         pop = toolbox.population(n=self.n_population)
         if self.base_features:
             pop += list(map(creator.Individual, (np.atleast_2d(self.base_features))))
-            
+
         print([np.sum(i) for i in pop])
         hof = tools.HallOfFame(1, similar=np.array_equal)
         stats = tools.Statistics(lambda ind: ind.fitness.values)
         stats.register("avg", np.mean, axis=0)
         # stats.register("std", np.std, axis=0)
         # stats.register("min", np.min, axis=0)
-        # stats.register("max", np.max, axis=0)
+        stats.register("max", np.max, axis=0)
 
         if self.verbose > 0:
             print("Selecting features with genetic algorithm.")
 
         with np.printoptions(precision=6, suppress=True, sign=" "):
             _, log = _eaFunction(
-                pop,
-                toolbox,
+                estimator=estimator,
+                X=X,
+                y=y,
+                groups=groups,
+                cv=cv,
+                scorer=scorer,
+                fit_params=self.fit_params,
+                cross_val_procedure=self.cross_val_procedure,
+                population=pop,
+                toolbox=toolbox,
                 cxpb=self.crossover_proba,
                 mutpb=self.mutation_proba,
                 ngen=self.n_generations,
